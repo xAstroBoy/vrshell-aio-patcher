@@ -27,6 +27,7 @@ extern "C" void* aio_worker_entry(void*);      // far-clip / moonjump / teleport
 extern "C" void* rt_worker_entry(void*);       // on-device cull/coord DUMPER + MCP socket
 extern "C" void* player_worker_entry(void*);   // walk / rotate / pos
 extern "C" void* unlock_worker_entry(void*);   // QuestUngater: unlock built-in hidden menus
+extern "C" void  unlock_arm_config_hook(void); // QuestUngater: arm the ShellApp config hook EARLY (lib-load), before construction
 
 // Bridges so the rendertrace TU (which does NOT include hookutil.h) can read/write the SHARED
 // hu:: feature-status registry — powers the `stat` bridge command (one view of every hook: armed/failed).
@@ -91,6 +92,13 @@ static void orchestrator_ctor() {
     if (started) return;
     started = true;
     if (!orch_in_vrshell()) return;   // inert outside the vrshell host process
+    // Arm the ungater's ShellApp construction hook RIGHT NOW — synchronously on the
+    // linker thread, before libshell's own init runs and long before the VR thread
+    // constructs ShellApp. The boot thread below spawns the ungater WORKER ~5s later,
+    // which is far too late for the one-shot ShellApp__E982F8 hook to ever fire. This
+    // is THE "hidden menus no longer unlock" regression (lib now arrives via DT_NEEDED
+    // instead of early Zygisk injection). Cheap: find_sig hits on the first try here.
+    unlock_arm_config_hook();
     LOGI("ALL-IN-ONE ctor — libshell pulled us in; launching orchestrator boot");
     pthread_t t;
     if (pthread_create(&t, nullptr, orch_boot, nullptr) == 0) pthread_detach(t);

@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cinttypes>
+#include <string>                    // std::string for app->wall pin (ABI-matches libshell's libc++)
 #include <unistd.h>
 #include <pthread.h>
 #include <dlfcn.h>
@@ -339,8 +340,10 @@ static void force_nocull_walk(uint64_t a4) {
     g_forcevis_n = flipped;
 }
 
+static void pin_tick();                                  // fwd (defined below, after the pin globals)
 extern "C" __attribute__((used))
 void hsr_rt_cull(uint64_t /*a1*/, uint64_t a2, uint64_t /*a3*/, uint64_t a4, uint64_t /*a5*/, uint64_t /*a6*/) {
+    pin_tick();                                           // execute a staged app->wall pin (per-frame, shell thread)
     g_cullctx = a2; g_listmgr = a4;                        // stash ctx (cam/frusta still valid later)
     if (g_forcevis) force_nocull_walk(a4);                 // TEST/FIX: turn culling OFF (every frame, before the original cull)
     uint64_t t = now_ms(); if (t - g_world_ms < 200) return;   // ~5 Hz snapshot
@@ -423,13 +426,60 @@ void hsr_rt_hzanim(uint64_t x0, uint64_t /*jointName*/, uint64_t /*out*/, uint64
     }
 }
 
+// ── APP → WALL PLACEMENT pinning ─────────────────────────────────────────────────
+// VrShell's own AllocentricLaunchController::HandlePinAppAtWall(this, std::string* component,
+// int rank) @ base+0x117A268 pins the named app to the wall locator whose rank matches (that
+// rank is the wall placement's propRank). It does NOT re-check allocentric capability — so it
+// pins ARBITRARY apps, which is exactly the "stick any app to a wall" ask (the drag UI only
+// offers whitelisted apps; the function underneath doesn't care). We (1) capture the controller
+// `this` from PrePinDefaultApps (fires at env load), (2) let the `pinwall` command stage the
+// app component + rank, and (3) EXECUTE the pin from the per-frame loco hook = the shell's OWN
+// thread. HandlePinAppAtWall mutates the controller's pinned-app map + calls the app-launch
+// path (flecs/shell state) — calling it from the socket thread would race and crash.
+static volatile uint64_t g_alc_ctrl   = 0;      // AllocentricLaunchController `this`
+static char              g_pin_app[256] = {0};  // staged app component name (socket thread writes)
+static volatile int      g_pin_rank    = 0;
+static volatile int      g_pin_pending = 0;
+typedef long (*PinAppFn)(void* self, void* compStr, int rank);
+// diagnostics captured on the shell thread when a pin fires (the shell's own logs are filtered from logcat):
+static volatile int      g_pin_done    = 0;      // a pin executed since last stage
+static volatile long     g_pin_ret     = 0;      // HandlePinAppAtWall return
+static volatile int      g_pin_nlocs   = -1;     // wall-locator vector count (ctrl+240..248, 60B stride); -1=not read
+static volatile int      g_pin_ranks[16] = {0};  // the ranks present in the wall-locator vector
+static volatile int      g_pin_nranks  = 0;
+static const uintptr_t   OFF_PREPIN    = 0x11776F8;  // AllocentricLaunchController::PrePinDefaultApps
+static const uintptr_t   OFF_PINATWALL = 0x117A268;  // AllocentricLaunchController::HandlePinAppAtWall (vf6)
+
+// PrePinDefaultApps(a1=controller): capture the controller. Runs at env load on the shell thread.
+extern "C" __attribute__((used))
+void hsr_rt_prepin(uint64_t a1, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+    if (okptr(a1)) g_alc_ctrl = a1;
+}
+
 // SlideLocomotionController_update(a1=this, a2, a3, a4, a5). Stashes the controller `this`
 // and a3 (a3+144 = live player position per the player-ctl reversing) so the MCP server can
-// read/write player pos/rot and movement on demand. Read-only here (no behavior change).
+// read/write player pos/rot and movement on demand. ALSO the safe execution point for a staged
+// app->wall pin (this runs each frame on the shell's own thread).
 extern "C" __attribute__((used))
 void hsr_rt_loco(uint64_t a1, uint64_t /*a2*/, uint64_t a3, uint64_t /*a4*/, uint64_t /*a5*/) {
     if (okptr(a1)) g_loco_this = a1;
     if (okptr(a3)) g_loco_a3 = a3;
+}
+
+// Execute a staged app->wall pin on the shell thread. Called from the per-frame cull hook (the loco hook is
+// owned by aio.cpp's moonjump, so it never installs here). HandlePinAppAtWall touches the controller's pinned-app
+// map + the app-launch path, so it MUST run on the shell's own thread — a per-frame render/sim hook, not the socket.
+static void pin_tick() {
+    if (!(g_pin_pending && g_alc_ctrl && g_base)) return;
+    // DIAGNOSE the wall-locator vector (ctrl+240=begin, +248=end, 60B stride, rank at +4): if there's no locator
+    // for this rank HandlePinAppAtWall silently no-ops, which is exactly the "I don't see it pinned" symptom.
+    uint64_t vb = *(volatile uint64_t*)(g_alc_ctrl + 240), ve = *(volatile uint64_t*)(g_alc_ctrl + 248);
+    int nl = (okptr(vb) && ve > vb && (ve - vb) % 60 == 0) ? (int)((ve - vb) / 60) : 0;
+    g_pin_nlocs = nl; g_pin_nranks = 0;
+    for (int i = 0; i < nl && i < 16; ++i) g_pin_ranks[g_pin_nranks++] = *(volatile int*)(vb + (uint64_t)i*60 + 4);
+    std::string comp(g_pin_app);
+    g_pin_ret = ((PinAppFn)(g_base + OFF_PINATWALL))((void*)g_alc_ctrl, &comp, g_pin_rank);
+    g_pin_pending = 0; g_pin_done = 1;
 }
 
 // ── GLOBAL ANIMATION TIMELINE control (freeze/slow/scrub) ────────────────────────
@@ -1129,6 +1179,21 @@ static int mcp_dispatch(char* cmd, char* out, int cap) {
         if (!post_teleport(g_base, x,y,z, yaw)) return snprintf(out,cap,"ERR no ShellApp (env not up)\n");
         return snprintf(out,cap,"OK warp -> %.2f,%.2f,%.2f yaw %.3f\n",(double)x,(double)y,(double)z,(double)yaw);
     }
+    if (!strncmp(cmd,"pinwall",7)) {   // stick ANY app to a wall placement: pinwall <app.component> <rank>
+        char app[256]={0}; int rank=0;
+        if (sscanf(cmd+7," %255s %d", app, &rank)!=2) return snprintf(out,cap,"usage: pinwall <app.component> <rank>  (rank = the wall placement's propRank)\n");
+        if (!g_alc_ctrl) return snprintf(out,cap,"ERR controller not captured yet (load a home env first)\n");
+        strncpy(g_pin_app, app, sizeof g_pin_app - 1); g_pin_app[sizeof g_pin_app - 1]=0;
+        g_pin_rank = rank; g_pin_pending = 1; g_pin_done = 0;   // executed on the shell thread by the loco hook next frame
+        return snprintf(out,cap,"OK staged pin '%s' at wall rank %d (then run `pinstat`)\n", app, rank);
+    }
+    if (!strncmp(cmd,"pinstat",7)) {   // report what the last staged pin actually saw on the shell thread
+        int n = snprintf(out,cap,"ctrl=0x%llx done=%d ret=%ld wallLocators=%d ranks=[",
+                         (unsigned long long)g_alc_ctrl, g_pin_done, g_pin_ret, g_pin_nlocs);
+        for (int i=0;i<g_pin_nranks && n<cap-8;++i) n += snprintf(out+n,cap-n,"%s%d",i?",":"",g_pin_ranks[i]);
+        n += snprintf(out+n,cap-n,"] pending=%d\n", g_pin_pending);
+        return n;
+    }
     if (!strncmp(cmd,"setpos ",7)) {   // write player position (a3+144). NOTE: physics may overwrite next frame.
         float v[3]={0,0,0}; sscanf(cmd+7,"%f %f %f",&v[0],&v[1],&v[2]);
         uint64_t a3=g_loco_a3; if(!okptr(a3)) return snprintf(out,cap,"ERR no loco ctx\n");
@@ -1200,7 +1265,29 @@ static int mcp_dispatch(char* cmd, char* out, int cap) {
         else        { g_gtime_mode=0; }                  // speed/normal -> getTime runs (only 0 freezes it)
         return snprintf(out,cap,"OK WORLD %s (HzAnim speed=%.3f, getTime %s)\n", v==0.f?"FROZEN":"running", v, v==0.f?"held":"free");
     }
-    return snprintf(out,cap,"ERR unknown cmd (ping|base|stat|gtime|renderables|envdump|findmat|findmesh|meshmat|meshprobe|hzanim|skeletons|read|write|r32|w32|rf32|wf32|log|loglevel|world|forcevis|loco|playerpos|tp|nogravity|rot|warp|setpos|move)\n");
+    return snprintf(out,cap,"ERR unknown cmd (ping|base|stat|gtime|renderables|envdump|findmat|findmesh|meshmat|meshprobe|hzanim|skeletons|read|write|r32|w32|rf32|wf32|log|loglevel|world|forcevis|loco|playerpos|tp|nogravity|rot|warp|pinwall|setpos|move)\n");
+}
+// One CONNECTION = one detached thread. PERSISTENT: loop reading '\n'-terminated commands, dispatch + reply to
+// EACH, until the client closes (recv<=0). A ONE-SHOT client (send one line + close) still works. A LIVE client
+// (the editor's player gizmo) keeps ONE socket open and streams warp/rot at drag rate = NO per-command connect
+// round-trip = smooth. ⛔ The server used to be SINGLE-CLIENT (one accept() then a blocking recv loop), so the
+// editor's persistent Track-Player socket STARVED every other client (an MCP tool, a second editor, a diagnostic
+// warp) — they'd connect into the backlog and never get accept()ed until the editor closed = "teleport doesn't
+// work while tracking". Now each connection gets its own thread + its own response buffer, so clients coexist.
+// (mcp_dispatch's warp/pos/nogravity are last-writer-wins on device memory — concurrent callers are benign.)
+static void* mcp_client_thread(void* arg) {
+    int c = (int)(intptr_t)arg;
+    char* resp = (char*)malloc(65536);                       // per-connection (was a shared static -> not reentrant)
+    if (!resp) { close(c); return nullptr; }
+    char line[1024]; int li=0; char ch;
+    for (;;) {
+        int n = recv(c,&ch,1,0);
+        if (n<=0) break;                                     // client closed / error -> done with this connection
+        if (ch=='\r') continue;
+        if (ch=='\n') { line[li]=0; if (li){ int rl=mcp_dispatch(line,resp,65536); if (send(c,resp,rl,0)<=0) break; } li=0; continue; }
+        if (li < (int)sizeof line-1) line[li++]=ch;
+    }
+    free(resp); close(c); return nullptr;
 }
 static void* control_server(void*) {
     int port = prop_int("rt_port", 27042);
@@ -1208,25 +1295,13 @@ static void* control_server(void*) {
     int one=1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK); addr.sin_port=htons(port);
     if (bind(s,(sockaddr*)&addr,sizeof addr)<0) { LOGW("mcp: bind 127.0.0.1:%d failed (in use?)",port); close(s); return nullptr; }
-    listen(s, 4);
-    LOGI("MCP control server LIVE on 127.0.0.1:%d  (adb forward tcp:%d tcp:%d)", port, port, port);
-    static char resp[65536];
+    listen(s, 8);
+    LOGI("MCP control server LIVE on 127.0.0.1:%d  (adb forward tcp:%d tcp:%d) [multi-client]", port, port, port);
     for (;;) {
         int c = accept(s, nullptr, nullptr); if (c < 0) continue;
-        // PERSISTENT connection: loop reading '\n'-terminated commands, dispatch + reply to EACH, until the
-        // client closes (recv<=0). A ONE-SHOT client (send one line + close) still works — it just closes after
-        // the first reply. A LIVE client (the editor's player gizmo) keeps ONE socket open and streams warp/rot
-        // at drag rate = NO per-command connect/adb-forward round-trip = smooth (the "gizmo laggy" fix). The old
-        // adb-forward wedge was a HALF-close hazard; a full close on the client side (what we do) is clean.
-        char line[1024]; int li=0; char ch;
-        for (;;) {
-            int n = recv(c,&ch,1,0);
-            if (n<=0) break;                                 // client closed / error -> done with this connection
-            if (ch=='\r') continue;
-            if (ch=='\n') { line[li]=0; if (li){ int rl=mcp_dispatch(line,resp,sizeof resp); if (send(c,resp,rl,0)<=0) break; } li=0; continue; }
-            if (li < (int)sizeof line-1) line[li++]=ch;
-        }
-        close(c);
+        pthread_t t;
+        if (pthread_create(&t, nullptr, mcp_client_thread, (void*)(intptr_t)c) == 0) pthread_detach(t);
+        else close(c);                                       // thread spawn failed -> drop this client, keep serving
     }
 }
 
@@ -1274,6 +1349,7 @@ static void apply_patch() {
     static const uint8_t PRO_SKEL[8]      = {0xef,0x3b,0xb6,0x6d,0xed,0x33,0x01,0x6d};
     static const uint8_t PRO_SLIDELOCO[8] = {0xff,0x83,0x05,0xd1,0xea,0x73,0x00,0xfd};
     static const uint8_t PRO_HZANIM[8]    = {0xff,0xc3,0x01,0xd1,0xfd,0x7b,0x04,0xa9};  // AnimationPlayback__210FA48 (SUB SP; STP)
+    static const uint8_t PRO_PREPIN[8]    = {0xfd,0x7b,0xba,0xa9,0xfb,0x0b,0x00,0xf9};  // PrePinDefaultApps (STP X29,X30,[SP,#-0x60]!; STR X27)
     auto verify_pro = [](uint8_t* fn, const uint8_t* exp, const char* nm) -> bool {
         uint8_t got[8]; if (safe_read((uint64_t)fn, got, 8) < 0) { LOGW("%s @ %p: unreadable — SKIP", nm, fn); return false; }
         if (memcmp(got, exp, 8) != 0) { LOGW("%s @ %p: prologue MISMATCH (build != IDB) exp %02x%02x%02x%02x got %02x%02x%02x%02x — SKIP (offset stale, would corrupt)",
@@ -1297,6 +1373,11 @@ static void apply_patch() {
         okl = verify_pro(g_base+OFF_SLIDELOCO, PRO_SLIDELOCO, "LOCO") && install_entry_hook(g_base + OFF_SLIDELOCO, (void*)hsr_rt_loco);
         if (okl) LOGI("LOCO hook @ %p armed", (void*)(g_base+OFF_SLIDELOCO)); else LOGW("loco hook: not armed");
         aio_feat_report("rt-loco", okl, okl ? "player pos/rot/move" : "offset stale (aio moonjump owns loco) — OK");
+    }
+    if (wantMcp) {   // APP->WALL pin: capture the AllocentricLaunchController `this` from PrePinDefaultApps (env load)
+        bool okp = verify_pro(g_base+OFF_PREPIN, PRO_PREPIN, "PREPIN") && install_entry_hook(g_base + OFF_PREPIN, (void*)hsr_rt_prepin);
+        if (okp) LOGI("PREPIN hook @ %p armed (app->wall via `pinwall`)", (void*)(g_base+OFF_PREPIN)); else LOGW("prepin hook: not armed");
+        aio_feat_report("pin-wall", okp, okp ? "app->wall pin armed (pinwall <app> <rank>)" : "PrePinDefaultApps prologue mismatch");
     }
     if (wantMcp) {   // HSR skinning hook (RenderableProxy__ABC928): capture the DEVICE's runtime joint matrices + curve
         okh = verify_pro(g_base+OFF_HZANIM_210FA48, PRO_HZANIM, "HZANIM") && install_entry_hook(g_base + OFF_HZANIM_210FA48, (void*)hsr_rt_hzanim);
