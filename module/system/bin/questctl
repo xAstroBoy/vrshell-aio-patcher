@@ -1,0 +1,59 @@
+#!/system/bin/sh
+# questctl — on-device control CLI for HSR env testing (installed to /system/bin
+# by the Quest-Ctl AIO Magisk module). Run as root (Magisk). Drives the headset
+# headless: env selection, worn-spoof, shell reload, log sniffing, app management.
+cmd="$1"; shift 2>/dev/null
+case "$cmd" in
+  awake)   # spoof "worn" -> stay active, suppress the idle menu/dock
+    setprop persist.device_config.mros_vendor.hmd_disable_prox_sensor true
+    am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null 2>&1
+    input keyevent KEYCODE_WAKEUP >/dev/null 2>&1
+    echo "awake (prox disabled, worn-spoofed)";;
+  sleep)   # restore normal proximity behaviour
+    setprop persist.device_config.mros_vendor.hmd_disable_prox_sensor false
+    am broadcast -a com.oculus.vrpowermanager.prox_open >/dev/null 2>&1
+    echo "sleep allowed (prox restored)";;
+  menu)    # best-effort dismiss of the universal menu/dock overlay (VR-composited)
+    am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null 2>&1
+    input keyevent KEYCODE_BACK >/dev/null 2>&1
+    echo "menu: worn-spoof + back sent";;
+  env)     # GET the selected env, or SET it: questctl env <pkg>  (-> apk://<pkg>/assets/scene.zip)
+    if [ -n "$1" ]; then
+      oculuspreferences --setc environment_selected "apk://$1/assets/scene.zip" \
+        && echo "environment_selected = apk://$1/assets/scene.zip (reload vrshell to apply)"
+    else
+      dumpsys oemprefs --user 0 get environment_selected 2>/dev/null || settings get secure environment_selected
+    fi;;
+  reloadshell) kill "$(pidof com.oculus.vrshell)" 2>/dev/null; echo "vrshell killed (reloads)";;
+  sniff)   # stream ShellHsr (or a given tag) — the sniff feed
+    tag="${1:-ShellHsr}"
+    exec logcat -v time -s "$tag":V *:E;;
+  tap)     input tap "$1" "$2"; echo "tap $1 $2";;
+  key)     input keyevent "$1"; echo "key $1";;
+  swipe)   input swipe "$1" "$2" "$3" "$4" "${5:-200}"; echo "swipe";;
+  screencap) screencap -p "${1:-/sdcard/_questctl_shot.png}"; echo "${1:-/sdcard/_questctl_shot.png}";;
+  button)  # inject a controller KEY (e.g. 304=A 305=B 307=X 308=Y) on BOTH controllers.
+    for d in /dev/input/event4 /dev/input/event5; do
+      sendevent $d 1 "$1" 1; sendevent $d 0 0 0; sendevent $d 1 "$1" 0; sendevent $d 0 0 0
+    done; echo "button $1 pressed";;
+  apps)    pm list packages -3 2>/dev/null | sed 's/package://' | sort;;        # user apps
+  allapps) pm list packages 2>/dev/null | sed 's/package://' | sort;;            # everything
+  current) dumpsys activity activities 2>/dev/null | grep -m1 -i "ResumedActivity\|topResumed" || dumpsys window 2>/dev/null | grep -m1 mCurrentFocus;;
+  launch)  monkey -p "$1" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 && echo "launched $1" || { am start -n "$1" 2>&1; };;
+  start)   am start -n "$1"; echo "started $1";;
+  kill)    am force-stop "$1"; echo "force-stopped $1";;
+  clear)   pm clear "$1"; echo "cleared data $1";;
+  # ── player control (consumed live by the AIO Zygisk locomotion hook) ──
+  teleport)  setprop hsr.tp "$1 $2 $3 ${4:-0}"; echo "teleport -> $1 $2 $3 yaw ${4:-0}";;   # x y z [yaw]
+  walk)      setprop hsr.walk "$1 $2"; echo "walk $1 $2 (fwd strafe; 'walk 0 0' to stop)";;
+  rotate)    setprop hsr.rot "$1"; echo "rotate yaw=$1 (face this yaw, in place)";;
+  nogravity) setprop hsr.nogravity "${1:-1}"; echo "nogravity=${1:-1} (player holds height after teleport; no fall/reset)";;
+  # ── libshell-patch tunables (consumed by the AIO Zygisk module) ──
+  unlimjump) setprop persist.hsr.unlimjump "${1:-1}"; echo "unlimjump=${1:-1} (reload vrshell to apply)";;
+  fly)       setprop persist.hsr.fly "${1:-1}"; echo "fly=${1:-1} (reload vrshell to apply)";;
+  farclip)   setprop persist.hsr.farclip "$1"; echo "farclip=$1 (reload vrshell to apply)";;
+  verbose)   setprop hsr.verbose "${1:-1}"; echo "verbose=${1:-1} (reload vrshell to apply)";;
+  debugui)   setprop hsr.debugui "${1:-1}"; echo "debugui=${1:-1} (reload vrshell to apply)";;
+  status)  echo "vrshell_pid=$(pidof com.oculus.vrshell) prox_disabled=$(getprop persist.device_config.mros_vendor.hmd_disable_prox_sensor) loglevel=$(getprop debug.oculus.shell.logLevel) unlimjump=$(getprop persist.hsr.unlimjump) farclip=$(getprop persist.hsr.farclip)";;
+  *) echo "usage: questctl {awake|sleep|menu|env [pkg]|reloadshell|sniff [tag]|tap X Y|key K|swipe X1 Y1 X2 Y2 [ms]|screencap [path]|button CODE|apps|allapps|current|launch PKG|start PKG/.Act|kill PKG|clear PKG|teleport X Y Z [yaw]|walk FWD STRAFE|rotate YAW|nogravity 0|1|unlimjump 0|1|fly 0|1|farclip V|verbose 0|1|debugui 0|1|status}";;
+esac

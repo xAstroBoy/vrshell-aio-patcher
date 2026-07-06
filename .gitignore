@@ -1,0 +1,30 @@
+# ── build artifacts ──────────────────────────────────────────────
+build/obj/
+build/libs/
+out/
+work/
+*.o
+*.so
+
+# ── Meta-proprietary / patched binaries — DO NOT PUBLISH ─────────
+# The patcher operates on Meta's stock VrShell.apk (which embeds libshell.so).
+# Neither the stock nor the patched apk may be redistributed — build your own
+# from your device's VrShell via scripts/build_and_deploy.sh.
+*.apk
+*.apk.idsig
+*.idsig
+dist/
+**/libshell.so
+**/base.apk
+
+# ── secrets / keys ───────────────────────────────────────────────
+keystore/
+*.keystore
+*.jks
+
+# ── editor / OS cruft ────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
