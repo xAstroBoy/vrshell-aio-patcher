@@ -28,3 +28,7 @@ keystore/
 *.swp
 .DS_Store
 Thumbs.db
+
+# zygisk build outputs
+build_zygisk/obj/
+build_zygisk/libs/
