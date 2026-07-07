@@ -1,0 +1,6 @@
+id=vrshell_zygisk
+name=VrShell AIO (Zygisk inject)
+version=v1.0
+versionCode=1
+author=xAstroBoy
+description=Injects the VrShell AIO patches (moonjump / far-clip / teleport / player-ctl / on-device dumper) into com.oculus.vrshell via Zygisk. Stock VrShell.apk is untouched (no repack, no mount, no re-sign) so the platform signature + horizonos perms stay intact.

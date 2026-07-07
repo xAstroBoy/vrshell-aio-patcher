@@ -40,7 +40,8 @@ inline int get_status_json(char* out, int cap);   // fwd
 // so this file is the reliable "where do we need to intervene" source (adb pull / cat it,
 // or the MCP reads it). Rewritten atomically-ish each report.
 inline void feat_dump_file() {
-    char js[2048]; int n = get_status_json(js, sizeof js);
+    char js[4096]; int n = get_status_json(js, sizeof js);
+    if (n < 0) n = 0; if (n > (int)sizeof js) n = (int)sizeof js;
     FILE* f = fopen("/data/local/tmp/aio_status.json", "we");
     if (f) { fwrite(js, 1, (size_t)n, f); fclose(f); }
 }
@@ -54,11 +55,26 @@ log:
     return ok;
 }
 inline int get_status_json(char* out, int cap) {   // for the MCP `status` command
-    int n = snprintf(out, cap, "{\"features\":[");
-    for (int i = 0; i < g_nfeat && n < cap - 96; i++)
-        n += snprintf(out + n, cap - n, "%s{\"name\":\"%s\",\"armed\":%s,\"detail\":\"%s\"}",
-                      i ? "," : "", g_feat[i].name, g_feat[i].armed ? "true" : "false", g_feat[i].detail);
-    n += snprintf(out + n, cap - n, "]}\n");
+    // CRASH-SAFE: snprintf() returns the WOULD-BE length, so `n` can run past `cap` when the
+    // buffer fills. Passing the resulting negative (cap - n) to the next snprintf underflows to
+    // a huge size_t and trips bionic's FORTIFY vsnprintf guard -> SIGABRT (this is exactly what
+    // crash-looped vrshell). Clamp `n` into [0, cap-1] after every write so the remaining size
+    // handed to snprintf is always >= 1. Never underflows regardless of feature count/detail len.
+    if (!out || cap <= 0) return 0;
+    int n = snprintf(out, (size_t)cap, "{\"features\":[");
+    if (n < 0) { out[0] = 0; return 0; }
+    if (n >= cap) n = cap - 1;
+    for (int i = 0; i < g_nfeat && n < cap - 1; i++) {
+        int w = snprintf(out + n, (size_t)(cap - n),
+                         "%s{\"name\":\"%s\",\"armed\":%s,\"detail\":\"%s\"}",
+                         i ? "," : "", g_feat[i].name, g_feat[i].armed ? "true" : "false", g_feat[i].detail);
+        if (w < 0) break;
+        n += w; if (n >= cap) { n = cap - 1; break; }
+    }
+    if (n < cap - 1) {
+        int w = snprintf(out + n, (size_t)(cap - n), "]}\n");
+        if (w > 0) { n += w; if (n >= cap) n = cap - 1; }
+    }
     return n;
 }
 

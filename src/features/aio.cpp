@@ -398,7 +398,7 @@ static void apply_farclip(uint8_t* fn, float farVal) {
 static const uint8_t kNavPrologue[16] = {0xff,0x43,0x01,0xd1,0xfd,0x7b,0x02,0xa9,0xf5,0x1b,0x00,0xf9,0xf4,0x4f,0x04,0xa9};
 static void apply_nonav(uint8_t* base) {
     if (!base) { feat_report("no-menu", false, "libshell base unknown"); return; }
-    uint8_t* fn = base + 0x10D2C24;                                   // NavigatorController__10D2C24 (show)
+    uint8_t* fn = base + 0x10D2C20;                                   // NavigatorController (show) — re-anchored for the current stock libshell (was 0x10D2C24)
     if (memcmp(fn, kNavPrologue, 16) != 0) {
         LOGW("no-menu: NavigatorController@%p prologue MISMATCH (build!=IDB) -> SKIP", fn);
         feat_report("no-menu", false, "NavigatorController prologue mismatch"); return; }
@@ -422,9 +422,27 @@ static void apply_nonav(uint8_t* base) {
 //  0xA96718 are plain reg-relative (LDR Q1,[X19,#96]; STRH WZR,[X8]; LDR X8,[X19,#408]; STR WZR,[X19,#576]),
 //  position-independent, so relocating them is safe. We only touch X9/X10/X11/S1/S2 (scratch) + read X20.
 // ============================================================================
+// SELF-LOCATING move() site (replaces the stale loco-relative fixed offset loco-0x18CCEA0+0xA96718,
+// which on 205.0.0.286.540 lands on a `BR X8` from an unrelated fn => install_hook would corrupt it =>
+// ShellMain SIGABRT/soft-brick). The 16-byte signature IS the exact 4 instructions we relocate
+// (LDR Q1,[X19,#96]; STRH WZR,[X8]; LDR X8,[X19,#408]; STR WZR,[X19,#576]), so a byte-exact hit is
+// SIMULTANEOUSLY the locate AND the verify — any build drift that moves/changes the site => no hit =>
+// moonjump skips, never patches wrong code. (Confirmed unique in this libshell @ file 0xa96730.)
+static const uint8_t kMoveSig[16] = { 0x61,0x1a,0xc0,0x3d, 0x1f,0x01,0x00,0x79,
+                                      0x68,0xce,0x40,0xf9, 0x7f,0x42,0x02,0xb9 };
+static uint8_t* cb_find_move(uint8_t* lo, uint8_t* hi) {
+    uint8_t* end = hi - sizeof kMoveSig;
+    for (uint8_t* p = lo; p <= end; ++p) if (memcmp(p, kMoveSig, sizeof kMoveSig) == 0) return p;
+    return nullptr;
+}
+static uint8_t* find_move() { return for_each_exec_seg(cb_find_move); }
+
 static void apply_ccmove(uint8_t* loco, CmdBlock* cmd) {
-    uint8_t* fn = loco - 0x18CCEA0 + 0xA96718;     // mid-move(), post-gravity, v3=X20
-    uintptr_t cont = (uintptr_t)fn + 16;           // 0xA96728
+    (void)loco;                                    // self-locates now (loco-relative offset went stale)
+    uint8_t* fn = find_move();                     // byte-exact scan = locate + verify in one
+    if (!fn) { LOGW("ccmove: move() post-gravity sig not found (build drift) — left stock");
+        feat_report("moonjump", false, "move() sig not found (build drift)"); return; }
+    uintptr_t cont = (uintptr_t)fn + 16;           // resume after the 4 relocated insns
     uint32_t c[32]; int n = 0;
     int ldrcmd=n++;                      // LDR X10,[PC,#cmdq]
     int bv3=n++;                         // CBZ X20, run        (v3 null -> skip)
@@ -470,9 +488,25 @@ static void apply_ccmove(uint8_t* loco, CmdBlock* cmd) {
 //  ("pressed" bytes at +0x50/+0xA0/+0xC2/+0xF2/+0x122/+0x152/+0x182/+0x1B2/+0x1E2) for a clean hold-to-fly gate.
 //  The 4 reloc'd insns are reg-relative; we continue via X16 so the original's X9 (=*(X1+8)) survives to 0x13F01C0.
 // ============================================================================
+// SELF-LOCATING HsrPlayerInput_vf4 site — the 4 relocated originals ARE the signature (locate+verify
+// in one). It happens to still sit at the loco-relative offset on 205.0.0.286.540 (moved +0x60 with
+// loco, unlike move() which moved +0x18), but self-locating survives independent drift and never
+// blind-patches on a miss. Confirmed unique @ file 0x13f0210.
+static const uint8_t kHpiSig[16] = { 0x28,0x20,0x40,0x79, 0x29,0x04,0x40,0xf9,
+                                     0x4a,0x00,0x80,0x52, 0x08,0x40,0x00,0x79 };
+static uint8_t* cb_find_hpi(uint8_t* lo, uint8_t* hi) {
+    uint8_t* end = hi - sizeof kHpiSig;
+    for (uint8_t* p = lo; p <= end; ++p) if (memcmp(p, kHpiSig, sizeof kHpiSig) == 0) return p;
+    return nullptr;
+}
+static uint8_t* find_hpi() { return for_each_exec_seg(cb_find_hpi); }
+
 static void apply_hpi(uint8_t* loco, CmdBlock* cmd) {
-    uint8_t* fn = loco - 0x18CCEA0 + 0x13F01B0;    // HsrPlayerInput_vf4 loc_13F01B0
-    uintptr_t cont = (uintptr_t)fn + 16;           // 0x13F01C0
+    (void)loco;                                    // self-locates now
+    uint8_t* fn = find_hpi();
+    if (!fn) { LOGW("hpi: HsrPlayerInput_vf4 sig not found (build drift) — left stock");
+        feat_report("input-capture", false, "HsrPlayerInput sig not found (drift)"); return; }
+    uintptr_t cont = (uintptr_t)fn + 16;           // resume after the 4 relocated insns
     uint32_t c[16]; int n = 0;
     int ldrcmd=n++;                      // LDR X10,[PC,#cmdq]
     c[n++]=0xF9004140u;                  // STR X0,[X10,#128]   cmd.hpi_addr = HsrPlayerInput
@@ -871,8 +905,12 @@ static void* worker(void*) {
     // was NOT at +376), so those offsets may be wrong -> the writes corrupt shell UI state
     // (the profile-hover menu VANISHED). GATE them OFF by default until each write target is
     // re-verified against THIS build; `setprop hsr.debugui 1` / `hsr.verbose 1` to opt back in.
-    if (prop_on("verbose", false)) apply_verbose(); else feat_report("verbose", false, "off (unverified offset on this build)");
-    if (prop_on("debugui", false)) apply_debugui(); else feat_report("debug-UI", false, "off (unverified offset on this build)");
+    // verbose is PATTERN-resolved (find_sig(kLogSig) -> resolve_adrp_global), not a blind fixed-offset
+    // write, so it is safe on any build. ON by default now; hsr.verbose 0 to silence.
+    if (prop_on("verbose", true)) apply_verbose(); else feat_report("verbose", false, "off (hsr.verbose 1 to enable)");
+    // debug-UI dropped from the status list (its offsets are unverified on this build and the blind
+    // writes can corrupt the shell UI); still opt-in via hsr.debugui for anyone who wants to try it.
+    if (prop_on("debugui", false)) apply_debugui();
 
     // FEATURE 3 — resolve the teleport plumbing and serve player-ctl prop commands.
     // resolve_teleport also gives us &g_ShellApp, which force_unlock_menu() reuses.

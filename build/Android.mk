@@ -11,7 +11,7 @@ LOCAL_MODULE     := questctl_aio
 # orchestrator's referenced worker-entry symbols are never stripped.
 LOCAL_SRC_FILES  := ../src/core/orchestrator.cpp \
                     ../src/merge/aio_tu.cpp ../src/merge/rendertrace_tu.cpp \
-                    ../src/merge/player_tu.cpp ../src/merge/unlock_tu.cpp
+                    ../src/merge/player_tu.cpp
 LOCAL_C_INCLUDES := $(LOCAL_PATH)/../src/common $(LOCAL_PATH)/../src/features $(LOCAL_PATH)/../src/core
 LOCAL_CPPFLAGS   := -std=c++17 -fvisibility=hidden -fexceptions -frtti -Os -Wno-unused -DAIO_MERGE_BUILD
 LOCAL_LDFLAGS    := -Wl,--no-gc-sections

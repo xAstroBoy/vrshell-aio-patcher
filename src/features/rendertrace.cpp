@@ -78,9 +78,9 @@ static const int     kSigOff       = 0x1C;
 static const uintptr_t OFF_EFA9D0          = 0xEFA9D0;   // anchor (far-clip fn)
 static const uintptr_t OFF_LOGLEVEL_N3     = 0x29EB9EC;  // global default log level (byte)
 static const uintptr_t OFF_LOGLEVEL_FLAG   = 0x29EB9ED;  // "use per-channel config" flag (byte)
-static const uintptr_t OFF_CULLJOB         = 0x9BA420;   // RenderableCullJob__9BA420 (per-frame frustum cull)
-static const uintptr_t OFF_SKEL_VF7        = 0x1480F70;  // SkeletonSystem_vf7 (per-frame skeleton/skinned-bounds)
-static const uintptr_t OFF_SLIDELOCO       = 0x18CCEA0;  // SlideLocomotionController_update (player pos/rot/move)
+static const uintptr_t OFF_CULLJOB         = 0x9BA39C;   // RenderableCullJob (per-frame frustum cull) — re-anchored for the current stock libshell build (was 0x9BA420)
+static const uintptr_t OFF_SKEL_VF7        = 0x1480F4C;  // SkeletonSystem_vf7 (per-frame skeleton/skinned-bounds) — re-anchored (was 0x1480F70)
+static const uintptr_t OFF_SLIDELOCO       = 0x18CCE7C;  // SlideLocomotionController_update (player pos/rot/move) — re-anchored (was 0x18CCEA0)
 static const int       LOCO_POS_OFF        = 144;        // a3+144 = live player position (IDA/player-ctl note)
 // ⛔ 1625F74/AC0958 are the MHE HzAnimSystem (shell panels/hands) — NOT the path our HSR-RenderGraph env
 //    uses (both came back calls=0 / all-rejected). The env's skinned meshes bind sbSkinningMatrices via the
@@ -90,7 +90,7 @@ static const int       LOCO_POS_OFF        = 144;        // a3+144 = live player
 // RELIABLE skeleton anchor: AnimationPlayback__210FA48(x0=skeleton, x1=jointName, x2=out) — decompiled,
 // it reads the POSED joint matrix from skeleton+72 (resultModelMatrices_ start)/+80 (end), 64B ea,
 // translation @+48. Hooking it captures the skeleton ptr -> read ALL posed joints = the env's live pose.
-static const uintptr_t OFF_HZANIM_210FA48  = 0x210FA48;
+static const uintptr_t OFF_HZANIM_210FA48  = 0x210FA24;   // AnimationPlayback pose — re-anchored for the current stock libshell (was 0x210FA48)
 // Game teleport message (player.cpp / nativeTeleportToCoordinates @0xFBDB54): resolve g_ShellApp, operator-new
 // a 128B msg {x@0,y@4,z@8,yaw@12,type=35@120}, post to *(g_ShellApp+16) via TypedMessageQueue kind=98. This is
 // the game's OWN teleport (respects collision, sets FACING yaw) — the proven way to ROTATE the player on device.
@@ -447,8 +447,8 @@ static volatile long     g_pin_ret     = 0;      // HandlePinAppAtWall return
 static volatile int      g_pin_nlocs   = -1;     // wall-locator vector count (ctrl+240..248, 60B stride); -1=not read
 static volatile int      g_pin_ranks[16] = {0};  // the ranks present in the wall-locator vector
 static volatile int      g_pin_nranks  = 0;
-static const uintptr_t   OFF_PREPIN    = 0x11776F8;  // AllocentricLaunchController::PrePinDefaultApps
-static const uintptr_t   OFF_PINATWALL = 0x117A268;  // AllocentricLaunchController::HandlePinAppAtWall (vf6)
+static const uintptr_t   OFF_PREPIN    = 0x11776F4;  // AllocentricLaunchController::PrePinDefaultApps — re-anchored for the current stock libshell (was 0x11776F8)
+static const uintptr_t   OFF_PINATWALL = 0x117A264;  // AllocentricLaunchController::HandlePinAppAtWall (vf6) — re-anchored (was 0x117A268)
 
 // PrePinDefaultApps(a1=controller): capture the controller. Runs at env load on the shell thread.
 extern "C" __attribute__((used))
@@ -1370,9 +1370,17 @@ static void apply_patch() {
         aio_feat_report("rt-skel", oks, oks ? "skeleton/skinned-bounds" : "prologue mismatch / install failed");
     }
     if (wantMcp) {   // locomotion hook: stash the player controller for pos/rot/move commands
-        okl = verify_pro(g_base+OFF_SLIDELOCO, PRO_SLIDELOCO, "LOCO") && install_entry_hook(g_base + OFF_SLIDELOCO, (void*)hsr_rt_loco);
-        if (okl) LOGI("LOCO hook @ %p armed", (void*)(g_base+OFF_SLIDELOCO)); else LOGW("loco hook: not armed");
-        aio_feat_report("rt-loco", okl, okl ? "player pos/rot/move" : "offset stale (aio moonjump owns loco) — OK");
+        uint8_t* lf = g_base + OFF_SLIDELOCO;
+        if (*(volatile uint32_t*)lf == 0x58000050u) {
+            // The AIO moonjump worker (runs first) already hooked SlideLocomotionController_update's
+            // entry — the SAME function. It owns the loco path and exposes player pos via its cmd
+            // block, so this is expected + fine, not a failure.
+            aio_feat_report("rt-loco", true, "loco owned by moonjump (player pos via moonjump)");
+        } else {
+            okl = verify_pro(lf, PRO_SLIDELOCO, "LOCO") && install_entry_hook(lf, (void*)hsr_rt_loco);
+            if (okl) LOGI("LOCO hook @ %p armed", (void*)lf); else LOGW("loco hook: not armed");
+            aio_feat_report("rt-loco", okl, okl ? "player pos/rot/move" : "prologue mismatch / install failed");
+        }
     }
     if (wantMcp) {   // APP->WALL pin: capture the AllocentricLaunchController `this` from PrePinDefaultApps (env load)
         bool okp = verify_pro(g_base+OFF_PREPIN, PRO_PREPIN, "PREPIN") && install_entry_hook(g_base + OFF_PREPIN, (void*)hsr_rt_prepin);
@@ -1385,7 +1393,7 @@ static void apply_patch() {
         aio_feat_report("rt-hzanim", okh, okh ? "AnimationPlayback pose (hzanim)" : "prologue mismatch / install failed");
     }
     if (wantMcp) {   // GLOBAL WORLD-TIME hook: HzAnimPlayback::update — override *(this+20) speed = freeze/slow/scrub
-        static const uintptr_t OFF_HZPLAYBACK_VF2 = 0xC888A8;
+        static const uintptr_t OFF_HZPLAYBACK_VF2 = 0xC8883C;   // HzAnimPlayback::update — re-anchored for the current stock libshell (was 0xC888A8)
         static const uint8_t PRO_HZPLAYBACK[8] = {0xeb,0x2b,0xb8,0x6d,0xe9,0x23,0x01,0x6d};   // STP q11,q10,[sp,#-256]!; STP q9,q8,[sp,#16]
         oka = verify_pro(g_base+OFF_HZPLAYBACK_VF2, PRO_HZPLAYBACK, "WORLDTIME") && install_entry_hook(g_base + OFF_HZPLAYBACK_VF2, (void*)hsr_rt_anim);
         if (oka) LOGI("WORLDTIME hook @ %p armed (global freeze/speed via `world`)", (void*)(g_base+OFF_HZPLAYBACK_VF2)); else LOGW("worldtime hook: not armed");
