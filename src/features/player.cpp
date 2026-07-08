@@ -58,9 +58,9 @@ struct CmdBlock {
 static const uint8_t kPrologue[16] = { 0xff,0x83,0x01,0xd1, 0xfd,0x7b,0x04,0xa9, 0xf4,0x4f,0x05,0xa9, 0xfd,0x03,0x01,0x91 };
 static const uint8_t kSig[16]      = { 0x08,0xcc,0x40,0xb9, 0x09,0x5c,0x40,0xf9, 0x08,0x79,0x1f,0x12, 0x08,0xcc,0x00,0xb9 };
 static const int       kSigOff = 0x1C;
-static const uintptr_t kEfaOff  = 0xEFA9D0;
-static const uintptr_t kLocoOff = 0x18CCEA0;
-static const uint32_t  kLocoPrologue = 0xD10583FFu;  // SUB SP,SP,#0x160 (IDA-confirmed @0x18CCEA0)
+static const uintptr_t kEfaOff  = 0xE408C8;   // far-clip fn file offset — v206 2.6 (was v205 0xEFA9D0)
+static const uintptr_t kLocoOff = 0xED7A78;   // SlideLocomotionController::update vf2 — v206 (was v205 0x18CCEA0)
+static const uint32_t  kLocoPrologue = 0xD103C3FFu;  // SUB SP,SP,#0xF0 (v206 @0xED7A78; was 0xD10583FF / #0x160)
 
 static uint8_t* find_efa() {
     FILE* f = fopen("/proc/self/maps", "re"); if (!f) return nullptr;
@@ -164,12 +164,12 @@ static bool install_loco(uint8_t* lf, CmdBlock* cmd) {
 // (0x2981030), allocates a 128-byte message {x@0,y@4,z@8, type=35@120}, and posts it to the ShellApp's
 // TypedMessageQueue (*(g_ShellApp+16)) with kind=98. Replicated here in pure C from the worker thread.
 static void post_teleport(uint8_t* base, float x, float y, float z, float yaw) {
-    uintptr_t app = *(volatile uintptr_t*)(base + 0x2981030);   // g_ShellApp
+    uintptr_t app = *(volatile uintptr_t*)(base + 0x2A2A030);   // g_ShellApp — v206 (was v205 0x2981030)
     if (!app) return;
     void* queue = *(void**)(app + 16);
     if (!queue) return;
-    void* (*op_new)(size_t)            = (void*(*)(size_t))(base + 0x27D5120);   // operator new (__wrap__Znwm)
-    void  (*tmq)(void*,int*,void*)     = (void(*)(void*,int*,void*))(base + 0xEA9DCC); // TypedMessageQueue post
+    void* (*op_new)(size_t)            = (void*(*)(size_t))(base + 0x286F4B0);   // operator new — v206 (was v205 0x27D5120)
+    void  (*tmq)(void*,int*,void*)     = (void(*)(void*,int*,void*))(base + 0xCC9944); // TypedMessageQueue post — v206 (was 0xEA9DCC)
     uint8_t* msg = (uint8_t*)op_new(128);
     if (!msg) return;
     memset(msg, 0, 128);

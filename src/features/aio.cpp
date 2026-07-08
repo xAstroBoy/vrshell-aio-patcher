@@ -81,9 +81,9 @@ static const int     kFarSigOff       = 0x1C;
 //    IDA-confirmed fields: config=*(a2+400); numAirJumps=*(config+44) (compared
 //    > airJumpCount to gate each mid-air jump); jumpInitialVelocity=*(config+32);
 //    locomotion output a3+144=newPos, a3+176=per-frame move delta (v127).
-static const char*    kLocoSig    = "37 c0 40 f9 ?? ?? ?? b4 36 c8 40 f9 f4 03 01 aa ?? ?? ?? b4 9a d6 40 f9 03 3c 00 f9";
+static const char*    kLocoSig    = "3a c0 40 f9 ?? ?? ?? b4 36 c8 40 f9 f4 03 01 aa ?? ?? ?? b4 99 d6 40 f9 03 3c 00 f9";  // v206 (X23->X26, X26->X25 regalloc; was 37.. / 9a..)
 static const int      kLocoSigOff = 0x34;
-static const uint32_t kLocoProlog = 0xD10583FFu;   // SUB SP,SP,#0x160 (loco fn entry word)
+static const uint32_t kLocoProlog = 0xD103C3FFu;   // SUB SP,SP,#0xF0 (v206 loco fn entry word; was 0xD10583FF / #0x160)
 
 // ── FEATURE 3: ShellApp teleport — nativeTeleportToCoordinates.
 //    Brackets the g_ShellApp ADRP/LDR pair (?? ?? ?? 90 = ADRP, ?? ?? 40 f9 = LDR):
@@ -395,10 +395,10 @@ static void apply_farclip(uint8_t* fn, float farVal) {
 //  (MOV X0,#0 ; RET) so it never shows -> the shell lands straight in the env, no menu.
 //  Prologue-VERIFIED vs the IDB (device build == IDB, prologue-confirmed) so a stale
 //  offset can NEVER patch wrong code. base = far-clip anchor fn - 0xEFA9D0. Toggle: hsr.nonav.
-static const uint8_t kNavPrologue[16] = {0xff,0x43,0x01,0xd1,0xfd,0x7b,0x02,0xa9,0xf5,0x1b,0x00,0xf9,0xf4,0x4f,0x04,0xa9};
+static const uint8_t kNavPrologue[16] = {0xff,0x03,0x06,0xd1,0xfd,0x7b,0x15,0xa9,0xfc,0x57,0x16,0xa9,0xf4,0x4f,0x17,0xa9};  // v206 SUB SP,#0x180; STP X29,X30,[SP,#0x150]; ... (was #0x50 frame)
 static void apply_nonav(uint8_t* base) {
     if (!base) { feat_report("no-menu", false, "libshell base unknown"); return; }
-    uint8_t* fn = base + 0x10D2C20;                                   // NavigatorController (show) — re-anchored for the current stock libshell (was 0x10D2C24)
+    uint8_t* fn = base + 0x105D16C;                                   // NavigatorController (show) — v206 (was v205 0x10D2C20)
     if (memcmp(fn, kNavPrologue, 16) != 0) {
         LOGW("no-menu: NavigatorController@%p prologue MISMATCH (build!=IDB) -> SKIP", fn);
         feat_report("no-menu", false, "NavigatorController prologue mismatch"); return; }
@@ -832,6 +832,17 @@ extern "C" void aio_set_nogravity(int on) {
     __system_property_set("hsr.nogravity", on ? "1" : "0");
 }
 extern "C" int  aio_get_nogravity()       { return g_moon_cmd ? (int)g_moon_cmd->nogravity : -1; }
+// ROBUST arbitrary teleport: drive the loco trampoline's tp_pending/tp[] — the hook turns it into a ONE-FRAME
+// a3+176 locomotion delta the game integrates itself (moves to EXACT xyz, no navmesh/teleport-target validation
+// and no fall), unlike post_teleport's game teleport MESSAGE which the shell rejects for off-target/arbitrary
+// coords (= "the gizmo only tracks, won't move the player"). Returns 1 if the loco hook is armed (else 0 =
+// "MOVE once on the headset so the loco context is captured"). Auto-clears when the hook consumes it next frame.
+extern "C" int  aio_set_tp(float x, float y, float z) {
+    if (!g_moon_cmd) return 0;
+    g_moon_cmd->tp[0]=x; g_moon_cmd->tp[1]=y; g_moon_cmd->tp[2]=z;
+    g_moon_cmd->tp_pending = 1u;
+    return (int)g_moon_cmd->tick > 0 ? 1 : 0;   // tick>0 => the loco hook is live (will apply the delta)
+}
 extern "C" int  aio_get_curpos(float out[3]) {   // returns tick (0 = env not rendering / pos stale), fills feet xyz
     if (!g_moon_cmd) return -1;
     out[0]=g_moon_cmd->curpos[0]; out[1]=g_moon_cmd->curpos[1]; out[2]=g_moon_cmd->curpos[2];
@@ -872,7 +883,12 @@ static void* worker(void*) {
     if (cmd) { cmd->moon_on = prop_on("moonjump", true) ? 1u : 0u;             // MOONJUMP on by default
                cmd->moon_rise = prop_f("moonrise", 0.050f, 0.0f, 10.0f);        // per-frame vertical lift (user-tuned natural climb; hsr.moonrise to adjust)
                cmd->moon_hold = (uint32_t)prop_f("moonhold", 8.0f, 0.0f, 600.0f); // tap-window frames before fly kicks in
-               cmd->nogravity = prop_on("nogravity", false) ? 1u : 0u;          // NO-GRAVITY off by default (editor/MCP toggle)
+               // NO-GRAVITY always starts OFF (gravity ON) on every vrshell launch / env switch. The editor
+               // "No gravity" toggle sets hsr.nogravity=1, a NON-persist system prop that SURVIVES vrshell
+               // restarts (only a reboot clears it) — so once toggled, every env switch kept gravity OFF
+               // ("switch env, no gravity on restart, should have gravity"). Force it off + CLEAR the sticky
+               // prop at startup so no-gravity is a live per-session toggle, never a carried-over default.
+               cmd->nogravity = 0u; __system_property_set("hsr.nogravity", "0");
                g_moon_cmd = cmd; }                                              // expose to the ctl-server accessors (rendertrace TU)
 
     bool doneFar = !wantFar, doneLoco = false, doneCP = !wantCP || g_cp_done;   // g_cp_done if hooked synchronously in postAppSpecialize
@@ -884,7 +900,7 @@ static void* worker(void*) {
             else { capture_lib_range(); apply_crashproof(af); }
             doneCP = true; } }
         if (!doneFar)  { uint8_t* fn = find_far();  if (fn) { apply_farclip(fn, farVal);
-            if (prop_on("nonav", true)) apply_nonav(fn - 0xEFA9D0);   // suppress the Navigator menu auto-open (hsr.nonav=0 to allow it)
+            if (prop_on("nonav", true)) apply_nonav(fn - 0xE408C8);   // suppress the Navigator menu auto-open (hsr.nonav=0 to allow it) — v206 base (was 0xEFA9D0)
             doneFar = true; } }
         if (!doneLoco) { uint8_t* lf = find_loco(); if (lf) {
             if (*(volatile uint32_t*)lf == 0x58000050u) LOGW("loco already hooked — skipping");

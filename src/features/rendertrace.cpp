@@ -75,12 +75,12 @@ extern "C" void aio_feat_report(const char* name, bool ok, const char* detail);
 static const uint8_t kPrologue[16] = { 0xff,0x83,0x01,0xd1, 0xfd,0x7b,0x04,0xa9, 0xf4,0x4f,0x05,0xa9, 0xfd,0x03,0x01,0x91 };
 static const uint8_t kSig[16]      = { 0x08,0xcc,0x40,0xb9, 0x09,0x5c,0x40,0xf9, 0x08,0x79,0x1f,0x12, 0x08,0xcc,0x00,0xb9 };
 static const int     kSigOff       = 0x1C;
-static const uintptr_t OFF_EFA9D0          = 0xEFA9D0;   // anchor (far-clip fn)
-static const uintptr_t OFF_LOGLEVEL_N3     = 0x29EB9EC;  // global default log level (byte)
-static const uintptr_t OFF_LOGLEVEL_FLAG   = 0x29EB9ED;  // "use per-channel config" flag (byte)
-static const uintptr_t OFF_CULLJOB         = 0x9BA39C;   // RenderableCullJob (per-frame frustum cull) — re-anchored for the current stock libshell build (was 0x9BA420)
-static const uintptr_t OFF_SKEL_VF7        = 0x1480F4C;  // SkeletonSystem_vf7 (per-frame skeleton/skinned-bounds) — re-anchored (was 0x1480F70)
-static const uintptr_t OFF_SLIDELOCO       = 0x18CCE7C;  // SlideLocomotionController_update (player pos/rot/move) — re-anchored (was 0x18CCEA0)
+static const uintptr_t OFF_EFA9D0          = 0xE408C8;   // anchor (far-clip fn) — v206 2.6 (was v205 0xEFA9D0)
+static const uintptr_t OFF_LOGLEVEL_N3     = 0x2A9D5F4;  // global default log level (byte) — v206 (was 0x29EB9EC)
+static const uintptr_t OFF_LOGLEVEL_FLAG   = 0x2A9D5F5;  // "use per-channel config" flag (byte) — v206 (was 0x29EB9ED)
+static const uintptr_t OFF_CULLJOB         = 0xE9E1E8;   // RenderableCullJob (per-frame frustum cull) — v206 (was v205.2 0x9BA420 / dep 0x9BA39C)
+static const uintptr_t OFF_SKEL_VF7        = 0x15A1140;  // SkeletonSystem_vf7 (per-frame skeleton/skinned-bounds) — v206 (was v205.2 0x1480F70)
+static const uintptr_t OFF_SLIDELOCO       = 0xED7A78;   // SlideLocomotionController::update vf2 (player pos/rot/move) — v206 (was v205.2 0x18CCEA0)
 static const int       LOCO_POS_OFF        = 144;        // a3+144 = live player position (IDA/player-ctl note)
 // ⛔ 1625F74/AC0958 are the MHE HzAnimSystem (shell panels/hands) — NOT the path our HSR-RenderGraph env
 //    uses (both came back calls=0 / all-rejected). The env's skinned meshes bind sbSkinningMatrices via the
@@ -90,13 +90,13 @@ static const int       LOCO_POS_OFF        = 144;        // a3+144 = live player
 // RELIABLE skeleton anchor: AnimationPlayback__210FA48(x0=skeleton, x1=jointName, x2=out) — decompiled,
 // it reads the POSED joint matrix from skeleton+72 (resultModelMatrices_ start)/+80 (end), 64B ea,
 // translation @+48. Hooking it captures the skeleton ptr -> read ALL posed joints = the env's live pose.
-static const uintptr_t OFF_HZANIM_210FA48  = 0x210FA24;   // AnimationPlayback pose — re-anchored for the current stock libshell (was 0x210FA48)
+static const uintptr_t OFF_HZANIM_210FA48  = 0x219A90C;   // AnimationPlayback pose — v206 (was v205.2 0x210FA48)
 // Game teleport message (player.cpp / nativeTeleportToCoordinates @0xFBDB54): resolve g_ShellApp, operator-new
 // a 128B msg {x@0,y@4,z@8,yaw@12,type=35@120}, post to *(g_ShellApp+16) via TypedMessageQueue kind=98. This is
 // the game's OWN teleport (respects collision, sets FACING yaw) — the proven way to ROTATE the player on device.
-static const uintptr_t OFF_G_SHELLAPP      = 0x2981030;  // g_ShellApp global
-static const uintptr_t OFF_OP_NEW          = 0x27D5120;  // operator new wrapper (__wrap__Znwm)
-static const uintptr_t OFF_TMQ_POST        = 0xEA9DCC;   // TypedMessageQueue post
+static const uintptr_t OFF_G_SHELLAPP      = 0x2A2A030;  // g_ShellApp global — v206 (was 0x2981030)
+static const uintptr_t OFF_OP_NEW          = 0x286F4B0;  // operator new wrapper (__wrap__Znwm) — v206 (was 0x27D5120)
+static const uintptr_t OFF_TMQ_POST        = 0xCC9944;   // TypedMessageQueue post — v206 (was 0xEA9DCC)
 
 static uint8_t* g_base = nullptr;
 
@@ -105,6 +105,7 @@ static uint8_t* g_base = nullptr;
 extern "C" void aio_set_nogravity(int on);
 extern "C" int  aio_get_nogravity();
 extern "C" int  aio_get_curpos(float out[3]);
+extern "C" int  aio_set_tp(float x, float y, float z);   // robust loco-delta teleport (arbitrary xyz, no validation/fall)
 
 // ── runtime world snapshot (stashed by the hooks so the MCP control server can
 //    inspect/dump the live cull world on demand, between frames) ──────────────
@@ -447,8 +448,8 @@ static volatile long     g_pin_ret     = 0;      // HandlePinAppAtWall return
 static volatile int      g_pin_nlocs   = -1;     // wall-locator vector count (ctrl+240..248, 60B stride); -1=not read
 static volatile int      g_pin_ranks[16] = {0};  // the ranks present in the wall-locator vector
 static volatile int      g_pin_nranks  = 0;
-static const uintptr_t   OFF_PREPIN    = 0x11776F4;  // AllocentricLaunchController::PrePinDefaultApps — re-anchored for the current stock libshell (was 0x11776F8)
-static const uintptr_t   OFF_PINATWALL = 0x117A264;  // AllocentricLaunchController::HandlePinAppAtWall (vf6) — re-anchored (was 0x117A268)
+static const uintptr_t   OFF_PREPIN    = 0x10622CC;  // AllocentricLaunchController::PrePinDefaultApps — v206 (was v205.2 0x11776F8)
+static const uintptr_t   OFF_PINATWALL = 0x10643C4;  // AllocentricLaunchController::HandlePinAppAtWall (vf6) — v206 (was v205.2 0x117A268)
 
 // PrePinDefaultApps(a1=controller): capture the controller. Runs at env load on the shell thread.
 extern "C" __attribute__((used))
@@ -644,18 +645,18 @@ static bool install_gtime_store_hook(uint8_t* fn, void* thunk) {
     void* tramp = mmap(nullptr, PG, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (tramp == MAP_FAILED) return false;
     uintptr_t cont1 = (uintptr_t)fn + 16;          // 0xDE987C (fall-through, X0!=0)
-    uintptr_t cont2 = (uintptr_t)fn + 0xB98;        // 0xDEA404 (CBZ taken, X0==0)  (0xDEA404-0xDE986C)
+    uintptr_t cont2 = (uintptr_t)fn + 0x28;         // v206 CBZ target 0x182d8b8 - 0x182d890 = 0x28 (X0==0 path; was v205 +0xB98)
     uintptr_t th    = (uintptr_t)thunk;
     uint32_t code[64]; int k = 0;
-    // (A) relocated de986c: STR S0,[X21,#0x254]  -> real elapsed written to globalUniforms.time (+596)
-    code[k++] = 0xBD0256A0;
+    // (A) relocated store: v206 STR S0,[X28,#0x254] -> real elapsed written to globalUniforms.time (+596) (was v205 [X21])
+    code[k++] = 0xBD025780;
     // (B) save volatiles x0..x17,x29,x30
     code[k++] = 0xA9B67BFD; code[k++] = 0x910003FD;
     code[k++] = 0xA90107E0; code[k++] = 0xA9020FE2; code[k++] = 0xA90317E4;
     code[k++] = 0xA9041FE6; code[k++] = 0xA90527E8; code[k++] = 0xA9062FEA;
     code[k++] = 0xA90737EC; code[k++] = 0xA9083FEE; code[k++] = 0xA90947F0;
-    // (C) arg0 = X21 (the UBO), call thunk (overrides +596 AFTER the real store)
-    code[k++] = 0xAA1503E0;   // MOV X0,X21
+    // (C) arg0 = X28 (the UBO on v206), call thunk (overrides +596 AFTER the real store)
+    code[k++] = 0xAA1C03E0;   // MOV X0,X28  (v206; was MOV X0,X21)
     int ldrThunkAt = k;
     code[k++] = 0x58000010u;  // LDR X16,[PC,#imm]  (patched)
     code[k++] = 0xD63F0200;   // BLR X16
@@ -665,7 +666,7 @@ static bool install_gtime_store_hook(uint8_t* fn, void* thunk) {
     code[k++] = 0xA94737EC; code[k++] = 0xA9483FEE; code[k++] = 0xA94947F0;
     code[k++] = 0xA8CA7BFD;
     // (E) relocated de9870 + CBZ(fixed) + de9878 + far continues
-    code[k++] = 0xF94002C0;   // LDR X0,[X22]         (de9870)
+    code[k++] = 0xF94002E0;   // LDR X0,[X23]  (v206; was LDR X0,[X22])  -> X0 now valid (fixes the x0=0x30000000N crash)
     code[k++] = 0xB40000C0;   // CBZ X0, #24 -> L_zero (X0==0 path)
     code[k++] = 0xF9400008;   // LDR X8,[X0]          (de9878)
     code[k++] = 0x58000049;   // LDR X9,[PC,#8]  -> cont1
@@ -1171,13 +1172,19 @@ static int mcp_dispatch(char* cmd, char* out, int cap) {
         if (!post_teleport(g_base, x,y,z, yaw)) return snprintf(out,cap,"ERR no ShellApp (env not up)\n");
         return snprintf(out,cap,"OK rot -> yaw %.3f at %.2f,%.2f,%.2f\n",(double)yaw,(double)x,(double)y,(double)z);
     }
-    // GAME teleport (no fall IN-BOUNDS, optional facing yaw) — distinct from tp-hold: posts the ShellApp msg so
-    // the game applies it with collision. `warp x y z [yaw]`. Out-of-bounds falls -> use nogravity+tp for that.
+    // ARBITRARY teleport (the editor gizmo / Teleport-to-camera): drive the loco trampoline's tp_pending delta —
+    // the game integrates it to the EXACT xyz with NO navmesh/teleport-target validation and NO fall. This is the
+    // "gizmo only tracks, won't move me" fix: post_teleport's game MESSAGE gets rejected for off-target/arbitrary
+    // coords (and is fragile to ShellApp msg-format drift), so it's now only a best-effort for FACING (yaw).
+    // `warp x y z [yaw]`.
     if (!strncmp(cmd,"warp",4) && (cmd[4]==' '||cmd[4]==0)) {
         float x=0,y=0,z=0,yaw=0; int got=sscanf(cmd+4,"%f %f %f %f",&x,&y,&z,&yaw);
         if (got<3) return snprintf(out,cap,"usage: warp <x> <y> <z> [yaw]\n");
-        if (!post_teleport(g_base, x,y,z, yaw)) return snprintf(out,cap,"ERR no ShellApp (env not up)\n");
-        return snprintf(out,cap,"OK warp -> %.2f,%.2f,%.2f yaw %.3f\n",(double)x,(double)y,(double)z,(double)yaw);
+        int armed = aio_set_tp(x,y,z);                 // ROBUST position move (loco-delta)
+        bool msg  = post_teleport(g_base, x,y,z, yaw); // best-effort facing (+ collision place when in-bounds)
+        if (!armed && !msg) return snprintf(out,cap,"ERR loco not armed (MOVE once on the headset) + no ShellApp\n");
+        return snprintf(out,cap,"OK warp -> %.2f,%.2f,%.2f yaw %.3f (loco-delta=%s msg=%s)\n",
+                        (double)x,(double)y,(double)z,(double)yaw, armed?"on":"off", msg?"on":"off");
     }
     if (!strncmp(cmd,"pinwall",7)) {   // stick ANY app to a wall placement: pinwall <app.component> <rank>
         char app[256]={0}; int rank=0;
@@ -1194,11 +1201,12 @@ static int mcp_dispatch(char* cmd, char* out, int cap) {
         n += snprintf(out+n,cap-n,"] pending=%d\n", g_pin_pending);
         return n;
     }
-    if (!strncmp(cmd,"setpos ",7)) {   // write player position (a3+144). NOTE: physics may overwrite next frame.
+    if (!strncmp(cmd,"setpos ",7)) {   // write player position via the loco-delta (integrated, not re-asserted by physics)
         float v[3]={0,0,0}; sscanf(cmd+7,"%f %f %f",&v[0],&v[1],&v[2]);
-        uint64_t a3=g_loco_a3; if(!okptr(a3)) return snprintf(out,cap,"ERR no loco ctx\n");
-        long w=safe_write(a3+LOCO_POS_OFF,v,12);
-        return snprintf(out,cap, w<0?"ERR EFAULT\n":"OK setpos %.2f,%.2f,%.2f (may be re-asserted by physics)\n",(double)v[0],(double)v[1],(double)v[2]);
+        if (aio_set_tp(v[0],v[1],v[2])) return snprintf(out,cap,"OK setpos %.2f,%.2f,%.2f (loco-delta)\n",(double)v[0],(double)v[1],(double)v[2]);
+        uint64_t a3=g_loco_a3; if(!okptr(a3)) return snprintf(out,cap,"ERR no loco ctx (MOVE once on the headset)\n");
+        long w=safe_write(a3+LOCO_POS_OFF,v,12);   // fallback raw write (may be re-asserted by physics)
+        return snprintf(out,cap, w<0?"ERR EFAULT\n":"OK setpos %.2f,%.2f,%.2f (raw; may be re-asserted)\n",(double)v[0],(double)v[1],(double)v[2]);
     }
     if (!strncmp(cmd,"move ",5)) {     // add delta to player position (a3+144)
         float d[3]={0,0,0}; sscanf(cmd+5,"%f %f %f",&d[0],&d[1],&d[2]);
@@ -1345,9 +1353,9 @@ static void apply_patch() {
     // code (e.g. the shell's profile-hover menu vanished). So before hooking we verify the
     // target's first 8 bytes EXACTLY match the IDB prologue; on mismatch we SKIP + log (never
     // corrupt), which also tells us the offset is stale for this build.
-    static const uint8_t PRO_CULLJOB[8]   = {0xff,0x43,0x03,0xd1,0xfd,0x7b,0x07,0xa9};
+    static const uint8_t PRO_CULLJOB[8]   = {0xff,0xc3,0x01,0xd1,0xfd,0x7b,0x01,0xa9};  // v206 SUB SP,#0x70; STP X29,X30,[SP,#0x10]
     static const uint8_t PRO_SKEL[8]      = {0xef,0x3b,0xb6,0x6d,0xed,0x33,0x01,0x6d};
-    static const uint8_t PRO_SLIDELOCO[8] = {0xff,0x83,0x05,0xd1,0xea,0x73,0x00,0xfd};
+    static const uint8_t PRO_SLIDELOCO[8] = {0xff,0xc3,0x03,0xd1,0xeb,0x2b,0x07,0x6d};  // v206 SUB SP,#0xF0; STP d11,d10,[SP,#0x70]
     static const uint8_t PRO_HZANIM[8]    = {0xff,0xc3,0x01,0xd1,0xfd,0x7b,0x04,0xa9};  // AnimationPlayback__210FA48 (SUB SP; STP)
     static const uint8_t PRO_PREPIN[8]    = {0xfd,0x7b,0xba,0xa9,0xfb,0x0b,0x00,0xf9};  // PrePinDefaultApps (STP X29,X30,[SP,#-0x60]!; STR X27)
     auto verify_pro = [](uint8_t* fn, const uint8_t* exp, const char* nm) -> bool {
@@ -1393,14 +1401,14 @@ static void apply_patch() {
         aio_feat_report("rt-hzanim", okh, okh ? "AnimationPlayback pose (hzanim)" : "prologue mismatch / install failed");
     }
     if (wantMcp) {   // GLOBAL WORLD-TIME hook: HzAnimPlayback::update — override *(this+20) speed = freeze/slow/scrub
-        static const uintptr_t OFF_HZPLAYBACK_VF2 = 0xC8883C;   // HzAnimPlayback::update — re-anchored for the current stock libshell (was 0xC888A8)
+        static const uintptr_t OFF_HZPLAYBACK_VF2 = 0x1CF0400;   // HzAnimPlayback::update vf2 — v206 (was v205.2 0xC888A8)
         static const uint8_t PRO_HZPLAYBACK[8] = {0xeb,0x2b,0xb8,0x6d,0xe9,0x23,0x01,0x6d};   // STP q11,q10,[sp,#-256]!; STP q9,q8,[sp,#16]
         oka = verify_pro(g_base+OFF_HZPLAYBACK_VF2, PRO_HZPLAYBACK, "WORLDTIME") && install_entry_hook(g_base + OFF_HZPLAYBACK_VF2, (void*)hsr_rt_anim);
         if (oka) LOGI("WORLDTIME hook @ %p armed (global freeze/speed via `world`)", (void*)(g_base+OFF_HZPLAYBACK_VF2)); else LOGW("worldtime hook: not armed");
         aio_feat_report("world-time", oka, oka ? "global freeze/speed (world cmd)" : "prologue mismatch / install failed");
     }
     if (wantMcp) {   // getTime() SHADER CLOCK: GlobalDescriptorManager::bind — override globalUniforms.time (+596)
-        static const uintptr_t OFF_GUNI = 0xDE9034;
+        static const uintptr_t OFF_GUNI = 0x182D744;   // GlobalDescriptorManager::bind entry — v206 (was 0xDE9034)
         static const uint8_t PRO_GUNI[8] = {0xef,0x3b,0xb6,0x6d,0xed,0x33,0x01,0x6d};   // STP q15,q14,[sp,#-160]!; STP q13,q12,[sp,#16]
         bool okg = verify_pro(g_base+OFF_GUNI, PRO_GUNI, "GTIME") && install_entry_hook(g_base + OFF_GUNI, (void*)hsr_rt_guni);
         if (okg) LOGI("GTIME hook @ %p armed (bind entry; diag capture of this/a2/k)", (void*)(g_base+OFF_GUNI)); else LOGW("gtime hook: not armed");
@@ -1409,8 +1417,8 @@ static void apply_patch() {
     if (wantMcp) {   // getTime STORE-SITE hook = the REAL clock override. globalUniforms.time (+596) is written
                      // every frame at bind+0xDE986C `STR S0,[X21,#0x254]` (the SOLE +596 writer). We hook it
                      // post-store so `world 0`/`world settime`/`world <0>` freeze/scrub flipbooks/train/uvscroll/VAT.
-        static const uintptr_t OFF_GTIME_STORE = 0xDE986C;
-        static const uint8_t PRO_GTIME_STORE[8] = {0xa0,0x56,0x02,0xbd,0xc0,0x02,0x40,0xf9};   // STR S0,[X21,#0x254]; LDR X0,[X22]
+        static const uintptr_t OFF_GTIME_STORE = 0x182D890;   // globalUniforms.time (+0x254) store site — v206 (was 0xDE986C)
+        static const uint8_t PRO_GTIME_STORE[8] = {0x80,0x57,0x02,0xbd,0xe0,0x02,0x40,0xf9};   // v206 STR S0,[X28,#0x254]; LDR X0,[X23]
         bool okgs = verify_pro(g_base+OFF_GTIME_STORE, PRO_GTIME_STORE, "GTIMESTORE") && install_gtime_store_hook(g_base + OFF_GTIME_STORE, (void*)hsr_gtime_store2);
         if (okgs) LOGI("GTIMESTORE hook @ %p armed (globalUniforms.time +596 OVERRIDE = flipbook/train/uvscroll freeze/scrub)", (void*)(g_base+OFF_GTIME_STORE));
         else LOGW("gtime-store hook: not armed");
